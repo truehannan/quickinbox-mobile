@@ -2,7 +2,6 @@ import SwiftUI
 
 struct OnboardingView: View {
     private let api: QuickInboxAPI
-    private let credentialStore: CredentialStore
     private let onAuthenticated: @MainActor (Credential, User) -> Void
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -26,11 +25,9 @@ struct OnboardingView: View {
 
     init(
         api: QuickInboxAPI,
-        credentialStore: CredentialStore,
         onAuthenticated: @escaping @MainActor (Credential, User) -> Void
     ) {
         self.api = api
-        self.credentialStore = credentialStore
         self.onAuthenticated = onAuthenticated
     }
 
@@ -562,14 +559,12 @@ struct OnboardingView: View {
                 let user = try await api.currentUser()
                 let restorableCredential = credential.caching(user: user)
                 await api.install(restorableCredential)
-                try credentialStore.save(restorableCredential)
 
                 isConnecting = false
                 AppFeedback.success()
                 onAuthenticated(restorableCredential, user)
             } catch {
                 if installedCredential {
-                    try? await api.logout(credentialStore: credentialStore)
                     await api.clearCredential()
                 }
                 isConnecting = false

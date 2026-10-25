@@ -12,11 +12,12 @@ class AppContainer(context: Context) {
     private val networkStatus = NetworkStatus(context)
     val api = QuickInboxApi(gson, hasInternetAccess = networkStatus::hasInternetAccess)
     val credentialStore = CredentialStore(context, gson)
+    val accountRegistry = AccountRegistry(context, gson)
     val mailboxCache = MailboxCache(context, gson)
     val threadCache = ThreadCache(context, gson)
     val preferences = AppPreferences(context, gson)
     val appLock = AppLockController(context)
-    val session = AppSession(api, credentialStore, mailboxCache, threadCache, preferences)
+    val session = AppSession(api, credentialStore, accountRegistry, mailboxCache, threadCache, preferences)
 
     init {
         api.onUnauthorized = { session.handleUnauthorized() }

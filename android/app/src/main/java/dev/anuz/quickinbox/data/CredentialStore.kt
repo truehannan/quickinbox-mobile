@@ -17,25 +17,48 @@ class CredentialStore(context: Context, private val gson: Gson) {
     )
 
     fun load(): Credential? {
-        val json = prefs.getString(KEY, null) ?: return null
+        return load(KEY)
+    }
+
+    fun load(accountId: String): Credential? {
+        val json = prefs.getString(keyForAccount(accountId), null) ?: return null
         return try {
             gson.fromJson(json, Credential::class.java)
         } catch (_: JsonSyntaxException) {
-            delete()
+            delete(accountId)
             throw ApiError.CorruptCredential()
         }
     }
 
     fun save(credential: Credential) {
-        prefs.edit().putString(KEY, gson.toJson(credential)).apply()
+        save(KEY, credential)
+    }
+
+    fun save(accountId: String, credential: Credential) {
+        prefs.edit().putString(keyForAccount(accountId), gson.toJson(credential)).apply()
     }
 
     fun delete() {
-        prefs.edit().remove(KEY).apply()
+        delete(KEY)
+    }
+
+    fun delete(accountId: String) {
+        prefs.edit().remove(keyForAccount(accountId)).apply()
+    }
+
+    private fun keyForAccount(accountId: String) = if (accountId == KEY) KEY else "$KEY:$accountId"
+
+    fun hasLegacyCredential(): Boolean = prefs.contains(KEY)
+
+    fun migrateLegacyCredential(accountId: String): Credential? {
+        val legacy = load() ?: return null
+        save(accountId, legacy)
+        delete()
+        return legacy
     }
 
     companion object {
         const val PREFS_NAME = "quickinbox_credentials"
-        private const val KEY = "mobile-session"
+        const val KEY = "mobile-session"
     }
 }

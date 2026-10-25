@@ -8,6 +8,11 @@ struct SettingsView: View {
     @StateObject private var model: SettingsViewModel
     @AppStorage(AppPreferences.showRemoteImagesByDefault) private var showRemoteImagesByDefault = false
     @AppStorage(AppPreferences.appThemeID) private var appThemeID = AppThemeRegistry.defaultThemeID
+    private let accounts: [SessionAccount]
+    private let activeAccountID: String?
+    private let onAddAccount: () -> Void
+    private let onSwitchAccount: (String) -> Void
+    private let onRemoveAccount: (String) -> Void
     private let onDisconnected: (String?) -> Void
 
     private var appearanceSummary: String {
@@ -30,16 +35,27 @@ struct SettingsView: View {
     @State private var showingRevokeConfirmation = false
     @State private var showingDisconnectConfirmation = false
     @State private var showingLocalWipeConfirmation = false
+    @State private var accountToRemove: SessionAccount?
     @State private var adaptiveTransitionColorScheme: ColorScheme?
 
     init(
         api: QuickInboxAPI,
         currentUser: User,
+        accounts: [SessionAccount],
+        activeAccountID: String?,
+        onAddAccount: @escaping () -> Void,
+        onSwitchAccount: @escaping (String) -> Void,
+        onRemoveAccount: @escaping (String) -> Void,
         onDisconnected: @escaping (String?) -> Void
     ) {
         _model = StateObject(
-            wrappedValue: SettingsViewModel(api: api, currentUser: currentUser)
+            wrappedValue: SettingsViewModel(api: api, currentUser: currentUser, activeAccountID: activeAccountID)
         )
+        self.accounts = accounts
+        self.activeAccountID = activeAccountID
+        self.onAddAccount = onAddAccount
+        self.onSwitchAccount = onSwitchAccount
+        self.onRemoveAccount = onRemoveAccount
         self.onDisconnected = onDisconnected
     }
 
@@ -96,6 +112,21 @@ struct SettingsView: View {
             Button("OK", role: .cancel) { model.operationError = nil }
         } message: {
             Text(model.operationError ?? "Try again.")
+        }
+        .alert("Remove Account?", isPresented: Binding(
+            get: { accountToRemove != nil },
+            set: { if !$0 { accountToRemove = nil } }
+        )) {
+            Button("Remove", role: .destructive) {
+                guard let accountToRemove else { return }
+                onRemoveAccount(accountToRemove.id)
+                self.accountToRemove = nil
+            }
+            Button("Cancel", role: .cancel) {
+                accountToRemove = nil
+            }
+        } message: {
+            Text("QuickInbox will remove this account from this iPhone. The server session stays active.")
         }
         // Settings is presented in its own sheet boundary. Apply the preference
         // here as well so removing a forced light/dark theme takes effect without
@@ -312,6 +343,7 @@ struct SettingsView: View {
     private var accountPage: some View {
         settingsPage {
             accountIdentitySummary
+            accountSwitcherSection
             accountSection
         }
         .navigationTitle("Account")
@@ -650,6 +682,55 @@ struct SettingsView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .accessibilityHint("Opens your QuickInbox account settings in the browser")
+            }
+        }
+
+        private var accountSwitcherSection: some View {
+            settingsPageSection(
+                "Accounts on this iPhone",
+                detail: "Switch or remove configured QuickInbox accounts."
+            ) {
+                ForEach(accounts) { account in
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(account.displayName)
+                                .font(.body.weight(.medium))
+                                .foregroundStyle(QuickInboxDesign.Palette.primaryText)
+                            Text(account.user.email)
+                                .font(.caption)
+                                .foregroundStyle(QuickInboxDesign.Palette.secondaryText)
+                        }
+                        Spacer(minLength: 8)
+                        if account.id == activeAccountID {
+                            Text("Active")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(settingsPalette.interactiveTint)
+                        } else {
+                            Button("Switch") {
+                                onSwitchAccount(account.id)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        Button(role: .destructive) {
+                            accountToRemove = account
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                }
+
+                Button {
+                    onAddAccount()
+                } label: {
+                    Label("Add Account", systemImage: "plus")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 14)
+                }
+                .buttonStyle(.plain)
             }
         }
     }
@@ -1086,15 +1167,17 @@ private final class SettingsViewModel: ObservableObject {
     let currentUser: User
 
     private let api: QuickInboxAPI
+    private let activeAccountID: String?
     private let credentialStore = CredentialStore()
     private var savedSignature = ""
     private var hasLoaded = false
 
     var signatureHasChanges: Bool { hasLoadedSignature && signatureDraft != savedSignature }
 
-    init(api: QuickInboxAPI, currentUser: User) {
+    init(api: QuickInboxAPI, currentUser: User, activeAccountID: String?) {
         self.api = api
         self.currentUser = currentUser
+        self.activeAccountID = activeAccountID
         selectedAddressID = UserDefaults.standard.string(forKey: AppPreferences.selectedSendingAddressID) ?? ""
     }
 
@@ -1203,6 +1286,9 @@ private final class SettingsViewModel: ObservableObject {
             )
         } catch {
             revocationError = revocationError ?? error
+        }
+        if let activeAccountID {
+            try? credentialStore.delete(accountID: activeAccountID)
         }
 
         clearLocalPreferences()

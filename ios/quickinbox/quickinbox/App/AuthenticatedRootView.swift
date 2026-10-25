@@ -7,8 +7,13 @@ struct AuthenticatedRootView: View {
     let mailboxCache: MailboxCache
     let threadCache: ThreadDetailCache
     let currentUser: User
+    let accounts: [SessionAccount]
+    let activeAccountID: String?
     let needsSignOut: Bool
     let onSignOut: () -> Void
+    let onAddAccount: () -> Void
+    let onSwitchAccount: (String) -> Void
+    let onRemoveAccount: (String) -> Void
     let onDisconnected: (String?) -> Void
 
     @State private var selectedThread: ThreadSelection?
@@ -21,14 +26,22 @@ struct AuthenticatedRootView: View {
     @State private var mailboxModel: MailboxViewModel
 
     init(api: QuickInboxAPI, mailboxCache: MailboxCache, threadCache: ThreadDetailCache,
-         currentUser: User, needsSignOut: Bool, onSignOut: @escaping () -> Void,
+         currentUser: User, accounts: [SessionAccount], activeAccountID: String?,
+         needsSignOut: Bool, onSignOut: @escaping () -> Void,
+         onAddAccount: @escaping () -> Void, onSwitchAccount: @escaping (String) -> Void,
+         onRemoveAccount: @escaping (String) -> Void,
          onDisconnected: @escaping (String?) -> Void) {
         self.api = api
         self.mailboxCache = mailboxCache
         self.threadCache = threadCache
         self.currentUser = currentUser
+        self.accounts = accounts
+        self.activeAccountID = activeAccountID
         self.needsSignOut = needsSignOut
         self.onSignOut = onSignOut
+        self.onAddAccount = onAddAccount
+        self.onSwitchAccount = onSwitchAccount
+        self.onRemoveAccount = onRemoveAccount
         self.onDisconnected = onDisconnected
         _mailboxModel = State(initialValue: MailboxViewModel(api: api, userID: currentUser.id, cache: mailboxCache, threadCache: threadCache))
     }
@@ -48,6 +61,19 @@ struct AuthenticatedRootView: View {
                 SettingsView(
                     api: api,
                     currentUser: currentUser,
+                    accounts: accounts,
+                    activeAccountID: activeAccountID,
+                    onAddAccount: onAddAccount,
+                    onSwitchAccount: { accountID in
+                        isSettingsPresented = false
+                        onSwitchAccount(accountID)
+                    },
+                    onRemoveAccount: { accountID in
+                        if accountID == activeAccountID {
+                            isSettingsPresented = false
+                        }
+                        onRemoveAccount(accountID)
+                    },
                     onDisconnected: onDisconnected
                 )
                 .toolbar {

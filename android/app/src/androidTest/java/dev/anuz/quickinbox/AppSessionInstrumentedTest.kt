@@ -4,6 +4,7 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.google.gson.GsonBuilder
 import dev.anuz.quickinbox.data.ApiDateAdapter
+import dev.anuz.quickinbox.data.AccountRegistry
 import dev.anuz.quickinbox.data.AppPreferences
 import dev.anuz.quickinbox.data.AppSession
 import dev.anuz.quickinbox.data.CredentialStore
@@ -35,6 +36,7 @@ class AppSessionInstrumentedTest {
     private lateinit var server: MockWebServer
     private lateinit var credentials: CredentialStore
     private lateinit var preferences: AppPreferences
+    private lateinit var accounts: AccountRegistry
     private lateinit var cache: MailboxCache
     private lateinit var threadCache: ThreadCache
 
@@ -44,10 +46,13 @@ class AppSessionInstrumentedTest {
         server.start()
         credentials = CredentialStore(context, gson)
         preferences = AppPreferences(context, gson)
+        accounts = AccountRegistry(context, gson)
         cache = MailboxCache(context, gson)
         threadCache = ThreadCache(context, gson)
         credentials.delete()
         preferences.clear()
+        accounts.saveAccounts(emptyList())
+        accounts.activeAccountId = null
         cache.clearAll()
         threadCache.clearAll()
     }
@@ -56,6 +61,8 @@ class AppSessionInstrumentedTest {
     fun tearDown() {
         credentials.delete()
         preferences.clear()
+        accounts.saveAccounts(emptyList())
+        accounts.activeAccountId = null
         cache.clearAll()
         threadCache.clearAll()
         server.shutdown()
@@ -70,7 +77,7 @@ class AppSessionInstrumentedTest {
                 .setBody("""{"user":{"id":"${user.id}","email":"${user.email}","name":"${user.name}"}}""")
         )
         val api = QuickInboxApi(gson)
-        val session = AppSession(api, credentials, cache, threadCache, preferences)
+        val session = AppSession(api, credentials, accounts, cache, threadCache, preferences)
         api.onUnauthorized = session::handleUnauthorized
 
         session.bootstrapIfNeeded()
@@ -85,7 +92,7 @@ class AppSessionInstrumentedTest {
     fun expiredCredentialIsRemovedWithoutNetworkRequest() = runBlocking {
         credentials.save(validCredential().copy(expiresAt = Date(System.currentTimeMillis() - 1)))
         val api = QuickInboxApi(gson)
-        val session = AppSession(api, credentials, cache, threadCache, preferences)
+        val session = AppSession(api, credentials, accounts, cache, threadCache, preferences)
         api.onUnauthorized = session::handleUnauthorized
 
         session.bootstrapIfNeeded()
@@ -115,13 +122,63 @@ class AppSessionInstrumentedTest {
             "thread-1"
         )
         val api = QuickInboxApi(gson)
-        val session = AppSession(api, credentials, cache, threadCache, preferences)
+        val session = AppSession(api, credentials, accounts, cache, threadCache, preferences)
 
         session.handleUnauthorized()
 
         assertNull(cache.load(origin, "user-1"))
         assertNull(threadCache.load(origin, "user-1", "thread-1"))
         assertTrue(session.phase.value is SessionPhase.Onboarding)
+    }
+
+    @Test
+    fun migratesLegacyCredentialToAccountRegistry() = runBlocking {
+        val legacy = validCredential().copy(
+            cachedUser = User(id = "legacy-user", email = "legacy@example.com", name = "Legacy")
+        )
+        credentials.save(legacy)
+        val api = QuickInboxApi(gson)
+        val session = AppSession(api, credentials, accounts, cache, threadCache, preferences)
+        api.onUnauthorized = session::handleUnauthorized
+
+        session.bootstrapIfNeeded()
+
+        val activeId = session.activeAccountId.value
+        assertTrue(activeId != null)
+        assertEquals(1, session.accounts.value.size)
+        assertEquals(legacy.cachedUser, credentials.load(activeId!!)?.cachedUser)
+        assertNull(credentials.load())
+    }
+
+    @Test
+    fun switchingAccountsInstallsSelectedCredentialAndClearsCaches() = runBlocking {
+        val firstUser = User(id = "user-1", email = "a@example.com", name = "A")
+        val secondUser = User(id = "user-2", email = "b@example.com", name = "B")
+        val first = accounts.createAccount(firstUser, server.url("/a").toString().trimEnd('/'))
+        val second = accounts.createAccount(secondUser, server.url("/b").toString().trimEnd('/'))
+        accounts.saveAccounts(listOf(first, second))
+        accounts.activeAccountId = first.id
+        credentials.save(first.id, validCredential().copy(origin = first.origin, cachedUser = firstUser))
+        credentials.save(second.id, validCredential().copy(origin = second.origin, cachedUser = secondUser))
+        cache.save(
+            listOf(ThreadSummary(threadId = "thread-1", latestId = "message-1")),
+            total = 1,
+            pageCount = 1,
+            origin = first.origin,
+            userId = firstUser.id
+        )
+        val api = QuickInboxApi(gson)
+        val session = AppSession(api, credentials, accounts, cache, threadCache, preferences)
+        api.onUnauthorized = session::handleUnauthorized
+
+        session.bootstrapIfNeeded()
+        session.switchAccount(second.id)
+
+        assertEquals(second.id, session.activeAccountId.value)
+        val phase = session.phase.value as SessionPhase.Authenticated
+        assertEquals(secondUser, phase.user)
+        assertEquals(second.origin, api.credential?.origin)
+        assertNull(cache.load(first.origin, firstUser.id))
     }
 
     private fun validCredential() = Credential(
