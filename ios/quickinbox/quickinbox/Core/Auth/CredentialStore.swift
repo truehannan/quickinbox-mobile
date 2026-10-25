@@ -12,7 +12,11 @@ final class CredentialStore: Sendable {
     }
 
     func load() throws -> Credential? {
-        var query = baseQuery
+        try load(accountID: account)
+    }
+
+    func load(accountID: String) throws -> Credential? {
+        var query = baseQuery(accountID: accountID)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
 
@@ -26,14 +30,18 @@ final class CredentialStore: Sendable {
         do {
             return try JSONDecoder().decode(Credential.self, from: data)
         } catch {
-            try? delete()
+            try? delete(accountID: accountID)
             throw CredentialStoreError.corruptCredential
         }
     }
 
     func save(_ credential: Credential) throws {
+        try save(credential, accountID: account)
+    }
+
+    func save(_ credential: Credential, accountID: String) throws {
         let data = try JSONEncoder().encode(credential)
-        var attributes = baseQuery
+        var attributes = baseQuery(accountID: accountID)
         attributes[kSecValueData as String] = data
         attributes[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
 
@@ -43,7 +51,7 @@ final class CredentialStore: Sendable {
                 kSecValueData as String: data,
                 kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
             ]
-            let updateStatus = SecItemUpdate(baseQuery as CFDictionary, updates as CFDictionary)
+            let updateStatus = SecItemUpdate(baseQuery(accountID: accountID) as CFDictionary, updates as CFDictionary)
             guard updateStatus == errSecSuccess else { throw CredentialStoreError.keychain(updateStatus) }
         } else if status != errSecSuccess {
             throw CredentialStoreError.keychain(status)
@@ -51,18 +59,33 @@ final class CredentialStore: Sendable {
     }
 
     func delete() throws {
-        let status = SecItemDelete(baseQuery as CFDictionary)
+        try delete(accountID: account)
+    }
+
+    func delete(accountID: String) throws {
+        let status = SecItemDelete(baseQuery(accountID: accountID) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw CredentialStoreError.keychain(status)
         }
     }
 
-    private var baseQuery: [String: Any] {
+    private func baseQuery(accountID: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: account
+            kSecAttrAccount as String: accountID == account ? account : "\(account):\(accountID)"
         ]
+    }
+
+    func hasLegacyCredential() -> Bool {
+        (try? load()) != nil
+    }
+
+    func migrateLegacyCredential(accountID: String) throws -> Credential? {
+        guard let legacy = try load() else { return nil }
+        try save(legacy, accountID: accountID)
+        try delete()
+        return legacy
     }
 }
 

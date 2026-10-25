@@ -3,6 +3,11 @@ package dev.anuz.quickinbox.ui
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -10,6 +15,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.anuz.quickinbox.data.AppContainer
 import dev.anuz.quickinbox.data.SessionPhase
@@ -35,7 +42,10 @@ fun QuickInboxApp() {
     val container = LocalAppContainer.current
     val session = container.session
     val phase by session.phase.collectAsStateWithLifecycle()
+    val accounts by session.accounts.collectAsStateWithLifecycle()
+    val activeAccountId by session.activeAccountId.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
+    var addingAccount by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) { session.bootstrapIfNeeded() }
 
@@ -43,15 +53,33 @@ fun QuickInboxApp() {
         SessionPhase.Booting -> LaunchScreen()
         is SessionPhase.Onboarding -> OnboardingFlow(
             initialMessage = current.message,
-            onAuthenticated = session::didAuthenticate
+            onAuthenticated = session::didAuthenticate,
+            onCancel = null
         )
-        is SessionPhase.Authenticated -> AuthenticatedRoot(
-            container = container,
-            user = current.user,
-            onDisconnected = { message ->
-                session.didDisconnect(message)
-            }
-        )
+        is SessionPhase.Authenticated -> if (addingAccount) {
+            OnboardingFlow(
+                initialMessage = null,
+                onAuthenticated = { credential, user ->
+                    addingAccount = false
+                    session.didAuthenticate(credential, user)
+                },
+                onCancel = { addingAccount = false }
+            )
+        } else {
+            AuthenticatedRoot(
+                container = container,
+                user = current.user,
+                accounts = accounts,
+                activeAccountId = activeAccountId,
+                onAddAccount = { addingAccount = true },
+                onSwitchAccount = { accountId -> scope.launch { session.switchAccount(accountId) } },
+                onRemoveAccount = { accountId -> scope.launch { session.removeAccount(accountId) } },
+                onDisconnected = { message ->
+                    addingAccount = false
+                    session.didDisconnect(message)
+                }
+            )
+        }
         is SessionPhase.RestoreFailed -> RestoreFailedScreen(
             message = current.message,
             onRetry = { scope.launch { session.retryRestore() } },
@@ -63,7 +91,8 @@ fun QuickInboxApp() {
 @Composable
 private fun OnboardingFlow(
     initialMessage: String?,
-    onAuthenticated: (dev.anuz.quickinbox.domain.Credential, dev.anuz.quickinbox.domain.User) -> Unit
+    onAuthenticated: (dev.anuz.quickinbox.domain.Credential, dev.anuz.quickinbox.domain.User) -> Unit,
+    onCancel: (() -> Unit)? = null
 ) {
     val container = LocalAppContainer.current
     val scope = rememberCoroutineScope()
@@ -93,10 +122,7 @@ private fun OnboardingFlow(
                     container.api.install(credential)
                     installed = true
                     val user = container.api.currentUser()
-                    val saved = credential.caching(user)
-                    container.api.install(saved)
-                    container.credentialStore.save(saved)
-                    saved to user
+                    credential.caching(user) to user
                 }
                 connecting = false
                 scanned = null
@@ -118,12 +144,23 @@ private fun OnboardingFlow(
     }
 
     QuickInboxNavHost(navController, startDestination = "home") {
-        composable("home") { OnboardingScreen(
-            error = error,
-            onScan = { error = null; navController.navigate("scanner") { launchSingleTop = true } },
-            onManual = { error = null; showManual = true },
-            onPrivacy = { navController.navigate("privacy") { launchSingleTop = true } }
-        )
+        composable("home") {
+            Box(modifier = Modifier.fillMaxSize()) {
+                OnboardingScreen(
+                    error = error,
+                    onScan = { error = null; navController.navigate("scanner") { launchSingleTop = true } },
+                    onManual = { error = null; showManual = true },
+                    onPrivacy = { navController.navigate("privacy") { launchSingleTop = true } }
+                )
+                onCancel?.let { cancel ->
+                    TextButton(
+                        onClick = cancel,
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(12.dp)
+                    ) { Text("Cancel") }
+                }
+            }
         }
         composable("scanner") { ScannerScreen(
             onBack = { navController.popBackStack("home", false) },

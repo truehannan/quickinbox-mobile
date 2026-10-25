@@ -56,6 +56,7 @@ import dev.anuz.quickinbox.data.AppContainer
 import dev.anuz.quickinbox.data.ConfigurableSwipeMailboxes
 import dev.anuz.quickinbox.data.MailboxSwipeControls
 import dev.anuz.quickinbox.data.MailboxNavigationStyle
+import dev.anuz.quickinbox.data.SessionAccount
 import dev.anuz.quickinbox.data.SwipeControl
 import dev.anuz.quickinbox.data.SwipeDirection
 import dev.anuz.quickinbox.data.availableSwipeControls
@@ -83,6 +84,11 @@ private enum class SettingsPage(val title: String) {
 fun SettingsScreen(
     container: AppContainer,
     user: User,
+    accounts: List<SessionAccount>,
+    activeAccountId: String?,
+    onAddAccount: () -> Unit,
+    onSwitchAccount: (String) -> Unit,
+    onRemoveAccount: (String) -> Unit,
     onBack: () -> Unit,
     onDisconnected: (String?) -> Unit
 ) {
@@ -99,6 +105,7 @@ fun SettingsScreen(
     var fromOpen by remember { mutableStateOf(false) }
     var confirmDisconnect by remember { mutableStateOf(false) }
     var confirmLocal by remember { mutableStateOf(false) }
+    var removeAccount by remember { mutableStateOf<SessionAccount?>(null) }
     var deviceToRevoke by remember { mutableStateOf<DeviceSession?>(null) }
     var remoteImages by remember { mutableStateOf(container.preferences.showRemoteImagesByDefault) }
     val snackbarHostState = remember { SnackbarHostState() }
@@ -192,7 +199,22 @@ fun SettingsScreen(
                             themeTitle = AppThemeOption.fromId(themeId).title,
                             onNavigate = { navController.navigate(it.name) { launchSingleTop = true } }
                         )
-                        SettingsPage.Account -> AccountPage(padding, user, container.api.credential?.origin)
+                        SettingsPage.Account -> AccountPage(
+                            padding = padding,
+                            user = user,
+                            origin = container.api.credential?.origin,
+                            accounts = accounts,
+                            activeAccountId = activeAccountId,
+                            onSwitchAccount = {
+                                onSwitchAccount(it)
+                                onBack()
+                            },
+                            onAddAccount = {
+                                onBack()
+                                onAddAccount()
+                            },
+                            onRemoveAccount = { removeAccount = it }
+                        )
                         SettingsPage.Appearance -> AppearancePage(
                             padding = padding,
                             selectedId = themeId,
@@ -298,6 +320,28 @@ fun SettingsScreen(
                 }) { Text("Remove", color = MaterialTheme.colorScheme.error) }
             },
             dismissButton = { TextButton(onClick = { confirmLocal = false }) { Text("Cancel") } }
+        )
+    }
+    removeAccount?.let { account ->
+        AlertDialog(
+            onDismissRequest = { removeAccount = null },
+            icon = { Icon(Icons.Rounded.DeleteOutline, contentDescription = null) },
+            title = { Text("Remove account from this device?") },
+            text = {
+                Text(
+                    "QuickInbox will remove ${account.displayName} from this phone. This does not revoke sessions on the server."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    removeAccount = null
+                    scope.launch {
+                        onRemoveAccount(account.id)
+                        if (account.id == activeAccountId) onBack()
+                    }
+                }) { Text("Remove", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = { removeAccount = null }) { Text("Cancel") } }
         )
     }
 }
@@ -811,15 +855,77 @@ private fun StaggeredSettingsContent(content: @Composable () -> Unit) {
 }
 
 @Composable
-private fun AccountPage(padding: PaddingValues, user: User, origin: String?) {
+private fun AccountPage(
+    padding: PaddingValues,
+    user: User,
+    origin: String?,
+    accounts: List<SessionAccount>,
+    activeAccountId: String?,
+    onSwitchAccount: (String) -> Unit,
+    onAddAccount: () -> Unit,
+    onRemoveAccount: (SessionAccount) -> Unit
+) {
     val context = LocalContext.current
     PageBody(padding) {
         InfoBanner(
             icon = Icons.Rounded.Person,
             title = "Your identity",
-            text = "This is the account currently connected to QuickInbox on this device."
+            text = "Switch between connected QuickInbox accounts on this device."
         )
         AccountCard(user, onClick = null)
+        SettingsGroup("Accounts on this device") {
+            accounts.forEach { account ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(settingsPanelColor())
+                        .clickable(enabled = account.id != activeAccountId) { onSwitchAccount(account.id) }
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            account.displayName,
+                            style = MaterialTheme.typography.titleMedium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            account.user.email,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    if (account.id == activeAccountId) {
+                        AssistChip(
+                            onClick = {},
+                            enabled = false,
+                            label = { Text("Active") }
+                        )
+                    } else {
+                        TextButton(onClick = { onSwitchAccount(account.id) }) { Text("Switch") }
+                    }
+                    IconButton(onClick = { onRemoveAccount(account) }) {
+                        Icon(Icons.Rounded.DeleteOutline, contentDescription = "Remove account")
+                    }
+                }
+            }
+            FilledTonalButton(
+                onClick = onAddAccount,
+                shape = MaterialTheme.shapes.large,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 52.dp)
+                    .padding(12.dp)
+            ) {
+                Icon(Icons.Rounded.Add, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("Add account")
+            }
+        }
         SettingsGroup("Account details") {
             InfoRow(Icons.Rounded.Email, "Email address", user.email)
             if (origin != null) {

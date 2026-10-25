@@ -80,6 +80,102 @@ struct CacheTests {
         cache.clearAll()
     }
 
+    @Test
+    func appSessionMigratesLegacyCredentialIntoAccountRegistry() async {
+        let suite = "cache-tests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = CredentialStore(service: suite)
+        let registry = AccountRegistry(defaults: defaults)
+        let cache = MailboxCache()
+        let threadCache = ThreadDetailCache()
+        cache.clearAll()
+        threadCache.clearAll()
+        registry.saveAccounts([])
+        registry.activeAccountID = nil
+        let legacyUser = User(id: "legacy-user", email: "legacy@example.com", name: "Legacy", isAdmin: false, createdAt: nil)
+        let credential = Credential(
+            origin: URL(string: "https://legacy-\(UUID().uuidString).example")!,
+            token: "token",
+            expiresAt: Date().addingTimeInterval(300),
+            cachedUser: legacyUser
+        )
+        try? store.delete()
+        try? store.save(credential)
+
+        let session = AppSession(
+            api: QuickInboxAPI(),
+            credentialStore: store,
+            accountRegistry: registry,
+            mailboxCache: cache,
+            threadCache: threadCache
+        )
+        await session.bootstrapIfNeeded()
+
+        #expect(session.accounts.count == 1)
+        #expect(session.activeAccountID != nil)
+        #expect((try? store.load()) == nil)
+        if let active = session.activeAccountID {
+            #expect((try? store.load(accountID: active))?.cachedUser == legacyUser)
+        }
+        try? store.delete()
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    @Test
+    func appSessionSwitchesAndRemovesAccounts() async {
+        let suite = "cache-tests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = CredentialStore(service: suite)
+        let registry = AccountRegistry(defaults: defaults)
+        let cache = MailboxCache()
+        let threadCache = ThreadDetailCache()
+        let session = AppSession(
+            api: QuickInboxAPI(),
+            credentialStore: store,
+            accountRegistry: registry,
+            mailboxCache: cache,
+            threadCache: threadCache
+        )
+
+        let userA = User(id: "user-a", email: "a@example.com", name: "A", isAdmin: false, createdAt: nil)
+        let userB = User(id: "user-b", email: "b@example.com", name: "B", isAdmin: false, createdAt: nil)
+        session.didAuthenticate(
+            credential: Credential(
+                origin: URL(string: "https://a-\(UUID().uuidString).example")!,
+                token: "token-a",
+                expiresAt: Date().addingTimeInterval(300),
+                cachedUser: userA
+            ),
+            user: userA
+        )
+        session.didAuthenticate(
+            credential: Credential(
+                origin: URL(string: "https://b-\(UUID().uuidString).example")!,
+                token: "token-b",
+                expiresAt: Date().addingTimeInterval(300),
+                cachedUser: userB
+            ),
+            user: userB
+        )
+
+        let firstID = session.accounts.first(where: { $0.user.id == userA.id })!.id
+        await session.switchAccount(firstID)
+        if case .authenticated(let user) = session.phase {
+            #expect(user.id == userA.id)
+        } else {
+            Issue.record("Expected authenticated phase after switching")
+        }
+
+        await session.removeAccount(firstID)
+        #expect(session.accounts.count == 1)
+        #expect(session.accounts.first?.user.id == userB.id)
+        try? store.delete()
+        if let remaining = session.accounts.first?.id {
+            try? store.delete(accountID: remaining)
+        }
+        defaults.removePersistentDomain(forName: suite)
+    }
+
     private func summary(id: String) -> ThreadSummary {
         ThreadSummary(
             threadID: id,

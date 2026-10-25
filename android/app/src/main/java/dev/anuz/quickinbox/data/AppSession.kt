@@ -20,6 +20,7 @@ sealed class SessionPhase {
 class AppSession(
     val api: QuickInboxApi,
     val credentialStore: CredentialStore,
+    val accountRegistry: AccountRegistry,
     val mailboxCache: MailboxCache,
     val threadCache: ThreadCache,
     val preferences: AppPreferences
@@ -27,6 +28,10 @@ class AppSession(
     private val mutex = Mutex()
     private val _phase = MutableStateFlow<SessionPhase>(SessionPhase.Booting)
     val phase: StateFlow<SessionPhase> = _phase.asStateFlow()
+    private val _accounts = MutableStateFlow(accountRegistry.loadAccounts())
+    val accounts: StateFlow<List<SessionAccount>> = _accounts.asStateFlow()
+    private val _activeAccountId = MutableStateFlow(accountRegistry.activeAccountId)
+    val activeAccountId: StateFlow<String?> = _activeAccountId.asStateFlow()
 
     private var hasBootstrapped = false
     private var restoreGeneration = 0
@@ -50,24 +55,65 @@ class AppSession(
 
     fun didAuthenticate(credential: Credential, user: User) {
         restoreGeneration += 1
+        val previousActive = accountRegistry.activeAccountId
+        val existing = accountRegistry.findByOriginAndUser(credential.origin, user.id)
+        val account = (existing ?: accountRegistry.createAccount(user, credential.origin))
+            .copy(user = user, origin = credential.origin)
+        accountRegistry.upsert(account)
+        accountRegistry.activeAccountId = account.id
+        _accounts.value = accountRegistry.loadAccounts()
+        _activeAccountId.value = account.id
         preferences.cachedUser = user
-        api.install(credential)
+        val persisted = credential.caching(user)
+        credentialStore.save(account.id, persisted)
+        if (previousActive != null && previousActive != account.id) {
+            mailboxCache.clearAll()
+            threadCache.clearAll()
+            preferences.selectedSendingAddressId = null
+        }
+        api.install(persisted)
         _phase.value = SessionPhase.Authenticated(user)
     }
 
     fun didDisconnect(message: String?) {
         restoreGeneration += 1
-        preferences.cachedUser = null
+        val active = accountRegistry.activeAccountId
+        if (active != null) {
+            credentialStore.delete(active)
+            accountRegistry.remove(active)
+            _accounts.value = accountRegistry.loadAccounts()
+            _activeAccountId.value = accountRegistry.activeAccountId
+        }
         mailboxCache.clearAll()
         threadCache.clearAll()
+        preferences.selectedSendingAddressId = null
+        val nextId = _activeAccountId.value
+        if (nextId != null) {
+            val credential = runCatching { credentialStore.load(nextId) }.getOrNull()
+            val cachedUser = credential?.cachedUser
+            if (credential != null && cachedUser != null && !credential.isExpired) {
+                preferences.cachedUser = cachedUser
+                api.install(credential)
+                _phase.value = SessionPhase.Authenticated(cachedUser)
+                return
+            }
+        }
+        preferences.cachedUser = null
         api.clearCredential()
         _phase.value = SessionPhase.Onboarding(message)
     }
 
     suspend fun removeLocalData() {
         restoreGeneration += 1
+        withContext(Dispatchers.IO) {
+            accountRegistry.loadAccounts().forEach { credentialStore.delete(it.id) }
+            if (credentialStore.hasLegacyCredential()) credentialStore.delete()
+        }
+        accountRegistry.saveAccounts(emptyList())
+        accountRegistry.activeAccountId = null
+        _accounts.value = emptyList()
+        _activeAccountId.value = null
         preferences.clear()
-        withContext(Dispatchers.IO) { credentialStore.delete() }
         api.clearCredential()
         mailboxCache.clearAll()
         threadCache.clearAll()
@@ -78,13 +124,50 @@ class AppSession(
         restoreGeneration += 1
         preferences.cachedUser = null
         try {
-            credentialStore.delete()
+            accountRegistry.activeAccountId?.let { credentialStore.delete(it) } ?: credentialStore.delete()
         } catch (_: Exception) {
         }
+        accountRegistry.activeAccountId?.let { accountRegistry.remove(it) }
+        _accounts.value = accountRegistry.loadAccounts()
+        _activeAccountId.value = accountRegistry.activeAccountId
         api.clearCredential()
         mailboxCache.clearAll()
         threadCache.clearAll()
+        preferences.selectedSendingAddressId = null
         _phase.value = SessionPhase.Onboarding("Your saved session is no longer valid. Connect this device again.")
+    }
+
+    suspend fun switchAccount(accountId: String) {
+        if (_phase.value is SessionPhase.Booting) return
+        if (accountId == accountRegistry.activeAccountId) return
+        if (accountRegistry.loadAccounts().none { it.id == accountId }) return
+        accountRegistry.activeAccountId = accountId
+        _activeAccountId.value = accountId
+        mailboxCache.clearAll()
+        threadCache.clearAll()
+        preferences.selectedSendingAddressId = null
+        restoreSession()
+    }
+
+    suspend fun removeAccount(accountId: String) {
+        if (accountRegistry.loadAccounts().none { it.id == accountId }) return
+        val isActive = accountRegistry.activeAccountId == accountId
+        withContext(Dispatchers.IO) { credentialStore.delete(accountId) }
+        accountRegistry.remove(accountId)
+        _accounts.value = accountRegistry.loadAccounts()
+        _activeAccountId.value = accountRegistry.activeAccountId
+        if (isActive) {
+            preferences.selectedSendingAddressId = null
+            mailboxCache.clearAll()
+            threadCache.clearAll()
+            if (_activeAccountId.value == null) {
+                preferences.cachedUser = null
+                api.clearCredential()
+                _phase.value = SessionPhase.Onboarding(null)
+            } else {
+                restoreSession()
+            }
+        }
     }
 
     private suspend fun restoreSession() {
@@ -93,17 +176,45 @@ class AppSession(
         _phase.value = SessionPhase.Booting
 
         try {
-            val credential = withContext(Dispatchers.IO) { credentialStore.load() }
-            if (credential == null) {
+            migrateLegacyAccountIfNeeded()
+            var activeId = accountRegistry.activeAccountId
+            var account = accountRegistry.loadAccounts().firstOrNull { it.id == activeId }
+            if (account == null) {
+                account = accountRegistry.loadAccounts().firstOrNull()
+                activeId = account?.id
+                accountRegistry.activeAccountId = activeId
+                _activeAccountId.value = activeId
+            }
+            if (activeId == null || account == null) {
                 api.clearCredential()
+                preferences.cachedUser = null
                 if (generation == restoreGeneration) _phase.value = SessionPhase.Onboarding(null)
+                return
+            }
+            _accounts.value = accountRegistry.loadAccounts()
+            val credential = withContext(Dispatchers.IO) { credentialStore.load(activeId) }
+            if (credential == null) {
+                accountRegistry.remove(activeId)
+                _accounts.value = accountRegistry.loadAccounts()
+                _activeAccountId.value = accountRegistry.activeAccountId
+                api.clearCredential()
+                if (_activeAccountId.value != null) {
+                    restoreSession()
+                } else if (generation == restoreGeneration) {
+                    _phase.value = SessionPhase.Onboarding(null)
+                }
                 return
             }
             if (credential.isExpired) {
                 preferences.cachedUser = null
-                withContext(Dispatchers.IO) { credentialStore.delete() }
+                withContext(Dispatchers.IO) { credentialStore.delete(activeId) }
+                accountRegistry.remove(activeId)
+                _accounts.value = accountRegistry.loadAccounts()
+                _activeAccountId.value = accountRegistry.activeAccountId
                 api.clearCredential()
-                if (generation == restoreGeneration) {
+                if (_activeAccountId.value != null) {
+                    restoreSession()
+                } else if (generation == restoreGeneration) {
                     _phase.value = SessionPhase.Onboarding(
                         "Your saved session expired. Connect this device again."
                     )
@@ -119,17 +230,27 @@ class AppSession(
 
             val user = withContext(Dispatchers.IO) { api.currentUser() }
             preferences.cachedUser = user
-            if (credential.cachedUser != user) {
-                withContext(Dispatchers.IO) { credentialStore.save(credential.caching(user)) }
-            }
+            withContext(Dispatchers.IO) { credentialStore.save(activeId, credential.caching(user)) }
+            accountRegistry.upsert(account.copy(user = user, origin = credential.origin))
+            _accounts.value = accountRegistry.loadAccounts()
             if (generation == restoreGeneration) _phase.value = SessionPhase.Authenticated(user)
         } catch (_: ApiError.Unauthorized) {
             preferences.cachedUser = null
-            withContext(Dispatchers.IO) { runCatching { credentialStore.delete() } }
+            val activeId = accountRegistry.activeAccountId
+            withContext(Dispatchers.IO) {
+                if (activeId != null) runCatching { credentialStore.delete(activeId) }
+                else runCatching { credentialStore.delete() }
+            }
+            activeId?.let { accountRegistry.remove(it) }
+            _accounts.value = accountRegistry.loadAccounts()
+            _activeAccountId.value = accountRegistry.activeAccountId
             api.clearCredential()
             mailboxCache.clearAll()
             threadCache.clearAll()
-            if (generation == restoreGeneration) {
+            preferences.selectedSendingAddressId = null
+            if (_activeAccountId.value != null) {
+                restoreSession()
+            } else if (generation == restoreGeneration) {
                 _phase.value = SessionPhase.Onboarding(
                     "Your saved session is no longer valid. Connect this device again."
                 )
@@ -144,7 +265,10 @@ class AppSession(
             }
         } catch (error: ApiError.Transport) {
             if (generation != restoreGeneration) return
-            val saved = withContext(Dispatchers.IO) { runCatching { credentialStore.load() }.getOrNull() }
+            val activeId = accountRegistry.activeAccountId
+            val saved = withContext(Dispatchers.IO) {
+                runCatching { if (activeId != null) credentialStore.load(activeId) else credentialStore.load() }.getOrNull()
+            }
             val cachedUser = saved?.cachedUser ?: preferences.cachedUser
             if (cachedUser != null) {
                 if (_phase.value is SessionPhase.Booting) {
@@ -164,5 +288,26 @@ class AppSession(
                 )
             }
         }
+    }
+
+    private suspend fun migrateLegacyAccountIfNeeded() {
+        val accounts = accountRegistry.loadAccounts()
+        if (accounts.isNotEmpty()) {
+            _accounts.value = accounts
+            if (accountRegistry.activeAccountId == null) {
+                accountRegistry.activeAccountId = accounts.first().id
+            }
+            _activeAccountId.value = accountRegistry.activeAccountId
+            return
+        }
+        if (!credentialStore.hasLegacyCredential()) return
+        val legacy = withContext(Dispatchers.IO) { credentialStore.load() } ?: return
+        val user = legacy.cachedUser ?: preferences.cachedUser ?: return
+        val account = accountRegistry.createAccount(user, legacy.origin)
+        accountRegistry.saveAccounts(listOf(account))
+        accountRegistry.activeAccountId = account.id
+        withContext(Dispatchers.IO) { credentialStore.migrateLegacyCredential(account.id) }
+        _accounts.value = accountRegistry.loadAccounts()
+        _activeAccountId.value = account.id
     }
 }

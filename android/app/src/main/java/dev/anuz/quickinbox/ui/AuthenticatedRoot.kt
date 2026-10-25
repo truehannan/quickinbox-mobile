@@ -35,6 +35,7 @@ import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.anuz.quickinbox.data.AppContainer
+import dev.anuz.quickinbox.data.SessionAccount
 import dev.anuz.quickinbox.domain.ThreadSummary
 import dev.anuz.quickinbox.domain.User
 import dev.anuz.quickinbox.ui.compose.ComposeMode
@@ -64,6 +65,11 @@ internal sealed class AuthDestination {
 fun AuthenticatedRoot(
     container: AppContainer,
     user: User,
+    accounts: List<SessionAccount>,
+    activeAccountId: String?,
+    onAddAccount: () -> Unit,
+    onSwitchAccount: (String) -> Unit,
+    onRemoveAccount: (String) -> Unit,
     onDisconnected: (String?) -> Unit
 ) {
     val navController = rememberNavController()
@@ -232,6 +238,11 @@ fun AuthenticatedRoot(
                     SettingsScreen(
                         container = container,
                         user = user,
+                        accounts = accounts,
+                        activeAccountId = activeAccountId,
+                        onAddAccount = onAddAccount,
+                        onSwitchAccount = onSwitchAccount,
+                        onRemoveAccount = onRemoveAccount,
                         onBack = { navigate(AuthDestination.Mailbox) },
                         onDisconnected = onDisconnected
                     )

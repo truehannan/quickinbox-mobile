@@ -5,6 +5,7 @@ struct ContentView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var session: AppSession
     @State private var appLock = AppLockController()
+    @State private var isAddingAccount = false
     @AppStorage(AppPreferences.appThemeID) private var appThemeID = AppThemeRegistry.defaultThemeID
 
     init() {
@@ -65,22 +66,39 @@ struct ContentView: View {
             case .onboarding(let message):
                 OnboardingContainer(
                     api: session.api,
-                    credentialStore: session.credentialStore,
                     message: message,
-                    onAuthenticated: session.didAuthenticate
+                    onAuthenticated: session.didAuthenticate,
+                    onCancel: nil
                 )
 
             case .authenticated(let user):
-                AuthenticatedRootView(
-                    api: session.api,
-                    mailboxCache: session.mailboxCache,
-                    threadCache: session.threadCache,
-                    currentUser: user,
-                    needsSignOut: session.needsSignOut,
-                    onSignOut: session.signOut,
-                    onDisconnected: session.didDisconnect
-                )
-                .id(user.id)
+                if isAddingAccount {
+                    OnboardingContainer(
+                        api: session.api,
+                        message: nil,
+                        onAuthenticated: { credential, authenticatedUser in
+                            isAddingAccount = false
+                            session.didAuthenticate(credential: credential, user: authenticatedUser)
+                        },
+                        onCancel: { isAddingAccount = false }
+                    )
+                } else {
+                    AuthenticatedRootView(
+                        api: session.api,
+                        mailboxCache: session.mailboxCache,
+                        threadCache: session.threadCache,
+                        currentUser: user,
+                        accounts: session.accounts,
+                        activeAccountID: session.activeAccountID,
+                        needsSignOut: session.needsSignOut,
+                        onSignOut: session.signOut,
+                        onAddAccount: { isAddingAccount = true },
+                        onSwitchAccount: { id in Task { await session.switchAccount(id) } },
+                        onRemoveAccount: { id in Task { await session.removeAccount(id) } },
+                        onDisconnected: session.didDisconnect
+                    )
+                    .id(user.id)
+                }
 
             case .restoreFailed(let message):
                 SessionRestoreErrorView(
@@ -165,9 +183,9 @@ private struct LaunchView: View {
 
 private struct OnboardingContainer: View {
     let api: QuickInboxAPI
-    let credentialStore: CredentialStore
     let message: String?
     let onAuthenticated: @MainActor (Credential, User) -> Void
+    let onCancel: (() -> Void)?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -183,9 +201,16 @@ private struct OnboardingContainer: View {
 
             OnboardingView(
                 api: api,
-                credentialStore: credentialStore,
                 onAuthenticated: onAuthenticated
             )
+            if let onCancel {
+                HStack {
+                    Spacer()
+                    Button("Cancel", action: onCancel)
+                        .padding(.horizontal)
+                        .padding(.bottom, 8)
+                }
+            }
         }
     }
 }
